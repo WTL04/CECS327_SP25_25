@@ -1,4 +1,11 @@
 import socket
+import os
+from dotenv import load_dotenv
+
+
+def connectDB():
+    database_url = os.getenv("DATABASE")
+
 
 def main():
     # ask the user for IP address and port number
@@ -24,9 +31,10 @@ def main():
                     data = incomingSocket.recv(8192).decode()
                     if not data:
                         break  # Exit loop if client disconnects
-                    
-                    # capitalize all letters in data
-                    newData = data.upper()
+
+                    # ADD NEW CODE HERE
+
+
                     
                     # sending back to client
                     incomingSocket.send(newData.encode("utf-8"))
