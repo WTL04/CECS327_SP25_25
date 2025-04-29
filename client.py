@@ -15,7 +15,7 @@ if __name__ == "__main__":
         print("2. What is the average water consumption per cycle in my smart dishwasher?")
         print("3. Which device consumed more electricity among my three IoT devices (two refrigerators and a dishwasher)?")
         
-        if message != 1 or message != 2 or message != 3:
+        if message not in ["1", "2", "3"]:
             print("Sorry, this query cannot be processed. Please try one of the following (1, 2, or 3)")
             continue
         else:

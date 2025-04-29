@@ -2,59 +2,72 @@ import socket
 import os
 from dotenv import load_dotenv
 import psycopg2 
+import json
 
 
-def connectDB():
-    # loading in .env variable
-    load_dotenv()
-    database_url = os.getenv("DATABASE")
-    print("Database connected!")
+# loading in .env variable
+load_dotenv()
+db_url = os.getenv("DATABASE")
+print("Database connected!")
 
-def test():
-    load_dotenv()
-    db_url = os.getenv("DATABASE")
+# connect to cursor for db commands
+conn = psycopg2.connect(db_url)
+cursor = conn.cursor()
 
-    # connect to db using cursor
+def init_database():
     conn = psycopg2.connect(db_url)
     cursor = conn.cursor()
 
-    # create table
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS playing_with_neon (
+    # Step 1: Create the table if it doesn't exist
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sensor_data (
             id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL,
+            asset_uid TEXT,
+            timestamp BIGINT,
+            sensor_name TEXT,
             value REAL
         );
-        """
-    )
-    
-    # insert data
-    cursor.execute("""
-        INSERT INTO playing_with_neon(name, value)
-        SELECT LEFT(md5(i::TEXT), 10), random()
-        FROM generate_series(1, 10) s(i);
     """)
-
-    # commit changes
     conn.commit()
 
-    # query and fetch data
-    cursor.execute("SELECT * FROM playing_with_neon;")
+    # Step 2: Fetch payloads from KitchenDevices_virtual
+    cursor.execute("""
+        SELECT payload
+        FROM "KitchenDevices_virtual"
+        LIMIT 100;  -- or more depending on your dataset
+    """)
     rows = cursor.fetchall()
 
-    # print results
+    # Step 3: Parse each payload and insert into sensor_data
     for row in rows:
-        print(row)
+        payload_json = row[0]
 
+        # If stored as a string, convert to dict
+        if isinstance(payload_json, str):
+            payload_json = json.loads(payload_json)
+
+        asset_uid = payload_json.get('asset_uid')
+        timestamp = int(payload_json.get('timestamp'))
+
+        for key, value in payload_json.items():
+            if key not in ['timestamp', 'topic', 'parent_asset_uid', 'asset_uid', 'board_name']:
+                sensor_name = key
+                sensor_value = float(value)
+                cursor.execute("""
+                    INSERT INTO sensor_data (asset_uid, timestamp, sensor_name, value)
+                    VALUES (%s, %s, %s, %s);
+                """, (asset_uid, timestamp, sensor_name, sensor_value))
+
+    conn.commit()
     cursor.close()
     conn.close()
+    print("sensor_data table populated successfully.")
+
+def test():
+    init_database();
 
 
 def main():
-    # connect to database 
-    connectDB()
-
     # ask the user for IP address and port number
     ip = input("Enter IP address: ")
     port = int(input("Enter port number: "))
