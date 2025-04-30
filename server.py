@@ -185,7 +185,7 @@ def handle_query_one(metadata):
 
     if moisture_values:
         avg = sum(moisture_values) / len(moisture_values)
-        return f"Average fridge moisture over the past 3 hours: {avg:.2f}% RH"
+        return f"Average fridge moisture from all fridges over the past 3 hours: {avg:.2f}% RH"
     else:
         return "No recent moisture data found for your kitchen fridge."
 
