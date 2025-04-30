@@ -10,11 +10,10 @@ load_dotenv()
 db_url = os.getenv("DATABASE")
 print("Database connected!")
 
-# connect to cursor for db commands
-conn = psycopg2.connect(db_url)
-cursor = conn.cursor()
-
 def init_database():
+   
+    print("Creating separate table for sensor data...")
+
     conn = psycopg2.connect(db_url)
     cursor = conn.cursor()
 
@@ -30,7 +29,7 @@ def init_database():
     """)
     conn.commit()
 
-    # Step 2: Fetch payloads from KitchenDevices_virtual
+    # fetch payloads from KitchenDevices_virtual
     cursor.execute("""
         SELECT payload
         FROM "KitchenDevices_virtual"
@@ -38,11 +37,11 @@ def init_database():
     """)
     rows = cursor.fetchall()
 
-    # Step 3: Parse each payload and insert into sensor_data
+    # parse each payload and insert into sensor_data
     for row in rows:
         payload_json = row[0]
 
-        # If stored as a string, convert to dict
+        # if stored as a string, convert to dict
         if isinstance(payload_json, str):
             payload_json = json.loads(payload_json)
 
@@ -63,14 +62,134 @@ def init_database():
     conn.close()
     print("sensor_data table populated successfully.")
 
-def test():
-    init_database();
+def init_metadata():
+    """
+    Returns a dictionary of all device meta data 
+
+    Key: device asset_uid from sensor_data table on neonDB 
+    Value: device meta data similar to json format
+
+        metadata = {
+
+            "obj-62t-uf5-4r9": {
+                "device_name": "Fridge 1",
+                "device_type": "Refrigerator",
+                "timezone": "PST",
+                "sensors": {
+                "ACS712 - Fridge 1": { "unit": "Amperes", "type": "SENSOR" },
+                "Moisture Meter - Fridge 1": { "unit": "% RH", "type": "SENSOR" }
+                }
+            }
+
+        }
+
+    """
+
+    conn = psycopg2.connect(db_url)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT "assetUid", "assetType", "customAttributes"
+        FROM "KitchenDevices_metadata"; 
+    """)
+
+    rows = cursor.fetchall()
+
+    metadata_dict = {}
+
+    for asset_uid, asset_type, custom_attrs in rows:
+        try:
+            obj = json.loads(custom_attrs) if isinstance(custom_attrs, str) else custom_attrs
+
+            device_name = obj.get("name", asset_uid)
+            additional = obj.get("additionalMetadata", {})
+            
+            # adding meta data into dictionary with asset_uid from KitchenDevices_metadata as key 
+            metadata_dict[asset_uid] = {
+                "device_name": device_name,
+                "device_type": additional.get("device_type", asset_type),
+                "timezone": additional.get("timezone", "PST"),
+                "location": additional.get("location", ""),
+                "sensors": {}
+            }
+
+            # traverse board children
+            for board in obj.get("children", []):
+                for sensor in board.get("customAttributes", {}).get("children", []):
+                    sensor_attrs = sensor.get("customAttributes", {})
+                    sensor_name = sensor_attrs.get("name")
+                    if sensor_name:
+                        metadata_dict[asset_uid]["sensors"][sensor_name] = {
+                            "type": sensor_attrs.get("type", "SENSOR"),
+                            "unit": sensor_attrs.get("unit"),
+                            "min": sensor_attrs.get("minValue"),
+                            "max": sensor_attrs.get("maxValue"),
+                            "desiredMin": sensor_attrs.get("desiredMinValue"),
+                            "desiredMax": sensor_attrs.get("desiredMaxValue")
+                        }
+
+        except Exception as e:
+            print(f"[Metadata error for {asset_uid}]: {e}")
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return metadata_dict
+
+def handle_query_one(metadata):
+    conn = psycopg2.connect(db_url)
+    cursor = conn.cursor()
+
+    moisture_values = []
+
+    # iterate through metadata_dict and find refrigerator devices
+    for asset_uid, metadata in metadata.items():
+        if metadata["device_type"].lower() != "refrigerator":
+            continue
+
+        device_name = metadata["device_name"]
+        timezone = metadata.get("timezone", "PST")
+
+        # find the moisture sensor
+        for sensor_info in metadata["sensors"].items():
+            if sensor_info.get("unit") == "% RH":
+
+                # query values from last 3 hours
+                cursor.execute("""
+                    SELECT value
+                    FROM sensor_data
+                    WHERE asset_uid = %s
+                    AND timestamp >= EXTRACT(EPOCH FROM (NOW() AT TIME ZONE %s) - INTERVAL '3 hours');
+                """, (asset_uid, timezone))
+
+                rows = cursor.fetchall()
+
+                for (value) in rows:
+                    moisture_values.append(float(value))
+                break
+
+    if moisture_values:
+        avg = sum(moisture_values) / len(moisture_values)
+        return f"Average fridge moisture over the past 3 hours: {avg:.2f}% RH"
+    else:
+        return "No recent moisture data found for your kitchen fridge."
+
 
 
 def main():
+   
+    # create database for sensor data 
+    init_database()
+
+    # get metadata dictionary containing metadata attributes
+    metadata = init_metadata()
+
     # ask the user for IP address and port number
-    ip = input("Enter IP address: ")
-    port = int(input("Enter port number: "))
+    ip = "0.0.0.0"
+    port = 4444
+    # ip = input("Enter IP address: ")
+    # port = int(input("Enter port number: "))
     
     # setting up socket and connecting an IP with a PORT number
     TCPSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -88,16 +207,18 @@ def main():
             try:
                 while True:
                     # receive data from client in string form
-                    data = incomingSocket.recv(8192).decode()
-                    if not data:
+                    query = incomingSocket.recv(8192).decode()
+                    if not query:
                         break  # Exit loop if client disconnects
 
                     # ADD NEW CODE HERE
 
+                    if query == "1":
+                        response = handle_query_one(metadata)
 
-                    
+
                     # sending back to client
-                    incomingSocket.send(newData.encode("utf-8"))
+                    incomingSocket.send(response.encode("utf-8"))
             except Exception as e:
                 print(f"Error: {e}")
             finally:
@@ -109,5 +230,4 @@ def main():
         TCPSocket.close()
 
 if __name__ == "__main__":
-    #main()
-    test()
+    main()
