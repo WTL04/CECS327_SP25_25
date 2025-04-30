@@ -143,7 +143,7 @@ def handle_query_one(metadata):
     conn = psycopg2.connect(db_url)
     cursor = conn.cursor()
 
-    moisture_values = []
+    moisture_values= []
 
     # iterate through metadata_dict and find refrigerator devices
     for asset_uid, metadata in metadata.items():
@@ -164,19 +164,20 @@ def handle_query_one(metadata):
                 cursor.execute("""
                     SELECT value
                     FROM sensor_data
-                    WHERE asset_uid = %s;
-                """, (asset_uid,))
+                    WHERE sensor_name = %s
+                    AND timestamp >= EXTRACT(EPOCH FROM (NOW() AT TIME ZONE %s) - INTERVAL '3 hours')
 
-                #  AND timestamp >= EXTRACT(EPOCH FROM (NOW() AT TIME ZONE %s) - INTERVAL '3 hours')
+                """, (sensor_name, timezone))
 
-                rows = cursor.fetchall()
+                rows = cursor.fetchall() # in format: [(34.1), (23.1,), ...]
 
-                for (value) in rows:
+                # debug
+                print(f"Fetched {len(rows)} values for {sensor_name}")
+
+
+                for (value,) in rows:
                     moisture_values.append(float(value))
-                    print("loop 3 works") # debug
                 break
-                
-            print(f"sensor_info: {sensor_info.get('unit')}") # debug
     
     conn.commit()
     cursor.close()
