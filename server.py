@@ -11,6 +11,9 @@ db_url = os.getenv("DATABASE")
 print("Database connected!")
 
 def init_database():
+    """
+    Create a new table named 'sensor_data' on NeonDB, containing payload data from 'KitchenDevices_virtual'.
+    """
    
     print("Creating separate table for sensor data...")
 
@@ -140,6 +143,11 @@ def init_metadata():
     return metadata_dict
 
 def handle_query_one(metadata):
+    """
+    Prints average moisture values from all fridges within a 3 hour interval.
+    Get the device type, timezone, sensor name and information from metadata dictionary.
+    Iterates through all sensors within 3 hour timestap, extracts value of sensor using SQL.
+    """
     conn = psycopg2.connect(db_url)
     cursor = conn.cursor()
 
@@ -148,13 +156,11 @@ def handle_query_one(metadata):
     # iterate through metadata_dict and find refrigerator devices
     for asset_uid, metadata in metadata.items():
         if metadata["device_type"].lower() != "refrigerator":
-            print("cannot find refrigerator") # debug
             continue
 
         device_name = metadata["device_name"]
         timezone = metadata.get("timezone", "PST")
 
-        print(device_name) # debug
 
         # find the moisture sensor and filter for "% RH" units
         for sensor_name, sensor_info in metadata["sensors"].items():
@@ -171,10 +177,6 @@ def handle_query_one(metadata):
 
                 rows = cursor.fetchall() # in format: [(34.1), (23.1,), ...]
 
-                # debug
-                print(f"Fetched {len(rows)} values for {sensor_name}")
-
-
                 for (value,) in rows:
                     moisture_values.append(float(value))
                 break
@@ -188,6 +190,9 @@ def handle_query_one(metadata):
         return f"Average fridge moisture from all fridges over the past 3 hours: {avg:.2f}% RH"
     else:
         return "No recent moisture data found for your kitchen fridge."
+
+def handle_query_two(metadata):
+
 
 def main():
    
@@ -227,6 +232,8 @@ def main():
 
                     if query == "1":
                         response = handle_query_one(metadata)
+                    elif query == "2":
+                        response = handle_query_two(metadata)
 
 
                     # sending back to client
