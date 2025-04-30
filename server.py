@@ -84,7 +84,7 @@ def init_metadata():
         }
 
     """
-
+    print("parsing metadata information...")
     conn = psycopg2.connect(db_url)
     cursor = conn.cursor()
 
@@ -116,8 +116,11 @@ def init_metadata():
             # traverse board children
             for board in obj.get("children", []):
                 for sensor in board.get("customAttributes", {}).get("children", []):
+
                     sensor_attrs = sensor.get("customAttributes", {})
-                    sensor_name = sensor_attrs.get("name")
+                    sensor_name = sensor_attrs.get("name", "").strip()
+                    unit = sensor_attrs.get("unit", "").strip()
+
                     if sensor_name:
                         metadata_dict[asset_uid]["sensors"][sensor_name] = {
                             "type": sensor_attrs.get("type", "SENSOR"),
@@ -131,7 +134,6 @@ def init_metadata():
         except Exception as e:
             print(f"[Metadata error for {asset_uid}]: {e}")
 
-    conn.commit()
     cursor.close()
     conn.close()
 
@@ -146,36 +148,45 @@ def handle_query_one(metadata):
     # iterate through metadata_dict and find refrigerator devices
     for asset_uid, metadata in metadata.items():
         if metadata["device_type"].lower() != "refrigerator":
+            print("cannot find refrigerator") # debug
             continue
 
         device_name = metadata["device_name"]
         timezone = metadata.get("timezone", "PST")
 
-        # find the moisture sensor
-        for sensor_info in metadata["sensors"].items():
-            if sensor_info.get("unit") == "% RH":
+        print(device_name) # debug
+
+        # find the moisture sensor and filter for "% RH" units
+        for sensor_name, sensor_info in metadata["sensors"].items():
+            if sensor_info.get("unit", "").strip() == "% RH":
 
                 # query values from last 3 hours
                 cursor.execute("""
                     SELECT value
                     FROM sensor_data
-                    WHERE asset_uid = %s
-                    AND timestamp >= EXTRACT(EPOCH FROM (NOW() AT TIME ZONE %s) - INTERVAL '3 hours');
-                """, (asset_uid, timezone))
+                    WHERE asset_uid = %s;
+                """, (asset_uid,))
+
+                #  AND timestamp >= EXTRACT(EPOCH FROM (NOW() AT TIME ZONE %s) - INTERVAL '3 hours')
 
                 rows = cursor.fetchall()
 
                 for (value) in rows:
                     moisture_values.append(float(value))
+                    print("loop 3 works") # debug
                 break
+                
+            print(f"sensor_info: {sensor_info.get('unit')}") # debug
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
 
     if moisture_values:
         avg = sum(moisture_values) / len(moisture_values)
         return f"Average fridge moisture over the past 3 hours: {avg:.2f}% RH"
     else:
         return "No recent moisture data found for your kitchen fridge."
-
-
 
 def main():
    
