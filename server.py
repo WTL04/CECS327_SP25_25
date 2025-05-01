@@ -199,6 +199,8 @@ def handle_query_two(metadata):
     gallon_values = []
 
     for asset_uid, metadata in metadata.items():
+
+        # iterate through metadata_dict and find dishwasher devices
         if metadata["device_type"].lower() != "dishwasher":
             continue
 
