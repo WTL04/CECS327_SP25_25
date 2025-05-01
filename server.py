@@ -172,7 +172,6 @@ def handle_query_one(metadata):
                     FROM sensor_data
                     WHERE sensor_name = %s
                     AND timestamp >= EXTRACT(EPOCH FROM (NOW() AT TIME ZONE %s) - INTERVAL '3 hours')
-
                 """, (sensor_name, timezone))
 
                 rows = cursor.fetchall() # in format: [(34.1), (23.1,), ...]
@@ -181,7 +180,6 @@ def handle_query_one(metadata):
                     moisture_values.append(float(value))
                 break
     
-    conn.commit()
     cursor.close()
     conn.close()
 
@@ -192,6 +190,56 @@ def handle_query_one(metadata):
         return "No recent moisture data found for your kitchen fridge."
 
 def handle_query_two(metadata):
+    """
+    Assuming a cycle is 30 minutes with a 1-minute sample rate
+    """
+    conn = psycopg2.connect(db_url)
+    cursor = conn.cursor()
+
+    gallon_values = []
+
+    for asset_uid, metadata in metadata.items():
+        if metadata["device_type"].lower() != "dishwasher":
+            continue
+
+        device_name = metadata["device_name"]
+
+        for sensor_name, sensor_info in metadata["sensors"].items():
+            if sensor_info.get("unit", "").strip() == "Liters Per Minute":
+
+                # grab only 30 values to simulate 30 minutes
+                cursor.execute("""
+                    SELECT value 
+                    FROM sensor_data 
+                    WHERE sensor_name = %s
+                    LIMIT 30
+                """, (sensor_name,))
+
+                rows = cursor.fetchall();
+
+                print(f"fetched {len(rows)} rows") # debug
+                
+                # track total water consumption per cycle
+                cycle_water_consumption = 0
+
+                for (value,) in rows:
+                    cycle_water_consumption += float(value)
+                
+                # convert liters into gallons
+                gallon_values.append(cycle_water_consumption * 0.264172)
+                break
+
+    cursor.close()
+    conn.close()
+
+    if gallon_values:
+        avg = sum(gallon_values) / len(gallon_values)
+        return f"Average water consumption per cycle in smart dishwasher: {avg:.2f} gallons"
+    else:
+        return "No recent water consumption data found for your smart dishwasher."
+
+
+
 
 
 def main():
