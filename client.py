@@ -12,7 +12,7 @@ if __name__ == "__main__":
     
     # debug
     host = "0.0.0.0"
-    port = 4444
+    port = 4445
 
     # establish socket connection with server
     TCPSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

@@ -3,6 +3,8 @@ import os
 from dotenv import load_dotenv
 import psycopg2 
 import json
+import schedule
+import time 
 
 
 # loading in .env variable
@@ -36,7 +38,6 @@ def init_database():
     cursor.execute("""
         SELECT payload
         FROM "KitchenDevices_virtual"
-        LIMIT 100;  -- or more depending on your dataset
     """)
     rows = cursor.fetchall()
 
@@ -168,16 +169,20 @@ def handle_query_one(metadata):
 
                 # query values from last 3 hours
                 cursor.execute("""
-                    SELECT value
-                    FROM sensor_data
-                    WHERE sensor_name = %s
-                    AND timestamp >= EXTRACT(EPOCH FROM (NOW() AT TIME ZONE %s) - INTERVAL '3 hours')
-                """, (sensor_name, timezone))
+                    SELECT payload
+                    FROM "KitchenDevices_virtual"
+                    WHERE payload::json->> %s IS NOT NULL
+                    AND time >= NOW() - INTERVAL '3 hours'
+                """, (sensor_name,))
 
                 rows = cursor.fetchall() # in format: [(34.1), (23.1,), ...]
 
-                for (value,) in rows:
-                    moisture_values.append(float(value))
+                for (payload,) in rows:
+                    payload_data = json.loads(payload) if isinstance(payload, str) else payload
+                    value = payload_data.get(sensor_name)
+
+                    if value:
+                        moisture_values.append(float(value))
                 break
     
     cursor.close()
@@ -211,24 +216,23 @@ def handle_query_two(metadata):
 
                 # grab only 30 values to simulate 30 minutes
                 cursor.execute("""
-                    SELECT value 
-                    FROM sensor_data 
-                    WHERE sensor_name = %s
+                    SELECT payload
+                    FROM "KitchenDevices_virtual"
+                    WHERE payload::json->> %s IS NOT NULL
                     LIMIT 30
                 """, (sensor_name,))
 
                 rows = cursor.fetchall();
 
-                print(f"fetched {len(rows)} rows") # debug
-                
                 # track total water consumption per cycle
                 cycle_water_consumption = 0
 
-                for (value,) in rows:
-                    cycle_water_consumption += float(value)
-                
-                # convert liters into gallons
-                gallon_values.append(cycle_water_consumption * 0.264172)
+                for (payload,) in rows:
+                    payload_data = json.loads(payload) if isinstance(payload, str) else payload
+                    cycle_water_consumption += float(payload_data.get(sensor_name))
+
+                    # convert liters into gallons
+                    gallon_values.append(cycle_water_consumption * 0.264172)
                 break
 
     cursor.close()
@@ -240,21 +244,24 @@ def handle_query_two(metadata):
     else:
         return "No recent water consumption data found for your smart dishwasher."
 
+def handle_query_three(metadata):
+    
 
 
+    return 
 
 
 def main():
    
     # create database for sensor data 
-    init_database()
+    # init_database()
 
     # get metadata dictionary containing metadata attributes
     metadata = init_metadata()
 
     # ask the user for IP address and port number
     ip = "0.0.0.0"
-    port = 4444
+    port = 4445
     # ip = input("Enter IP address: ")
     # port = int(input("Enter port number: "))
     
@@ -285,7 +292,6 @@ def main():
                     elif query == "2":
                         response = handle_query_two(metadata)
 
-
                     # sending back to client
                     incomingSocket.send(response.encode("utf-8"))
             except Exception as e:
@@ -300,3 +306,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+    """
+    running a function every t time
+
+    schedule.every(5).seconds.do(test)
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+    """"
+
+
+
