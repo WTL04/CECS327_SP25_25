@@ -150,7 +150,7 @@ def init_metadata():
 
 
 
-def get_average_moisture_from_dict(metadata, dict_1):
+def handle_query_one(metadata, dict_1):
     """
     Returns the average moisture from all fridges using the data in dict_1
     collected within the past 3 hours.
@@ -237,7 +237,6 @@ def main():
     # get metadata dictionary containing metadata attributes
     metadata = init_metadata()
    
-
     # ask the user for IP address and port number
     ip = "0.0.0.0"
     port = 4444
@@ -267,9 +266,7 @@ def main():
                     # ADD NEW CODE HERE
 
                     if query == "1":
-                        response = get_average_moisture_from_dict(metadata, dict_1)
-                    elif query == "2":
-                        response = handle_query_two(metadata)
+                        response = handle_query_one(metadata, dict_1)
 
                     # sending back to client
                     incomingSocket.send(response.encode("utf-8"))
@@ -282,14 +279,6 @@ def main():
         print("\nServer shutting down...")
     finally:
         TCPSocket.close()
-
-
-    # updating dictionaries for recent data retrieval 
-    schedule.every(5).seconds.do(lambda: update(metadata))
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
 
 
 def update(metadata):
