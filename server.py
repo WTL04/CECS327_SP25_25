@@ -244,12 +244,6 @@ def handle_query_two(metadata):
     else:
         return "No recent water consumption data found for your smart dishwasher."
 
-def handle_query_three(metadata):
-    
-
-
-    return 
-
 
 def main():
    
