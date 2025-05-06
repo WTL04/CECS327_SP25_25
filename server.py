@@ -5,6 +5,7 @@ import psycopg2
 import json
 import schedule
 import time 
+from collections import defaultdict
 
 
 # loading in .env variable
@@ -12,59 +13,64 @@ load_dotenv()
 db_url = os.getenv("DATABASE")
 print("Database connected!")
 
-def init_database():
-    """
-    Create a new table named 'sensor_data' on NeonDB, containing payload data from 'KitchenDevices_virtual'.
-    """
-   
-    print("Creating separate table for sensor data...")
+# global device dictionaries 
+dict_1 = defaultdict(lambda: defaultdict(list))
+dict_2 = defaultdict(list)
+dict_3 = defaultdict(list)
 
+
+
+def update_dict1(device_name, metadata):
+    """
+    Updates dict_1 to contain device name as key and sensor readings as lists of (timestamp, value) tuples.
+        
+    Example:
+        {
+            "Fridge 2": {
+            "Moisture Meter - Fridge 2": [(timestamp, 1.2), ...],
+            "ACS712 - Fridge 2": [(timestamp, 1.2), ...),
+            "Other Sensor - Fridge 2": [(timestamp, 1.2), ...]
+            }
+        }
+    """
     conn = psycopg2.connect(db_url)
     cursor = conn.cursor()
+    
+    for asset_uid, device_info in metadata.items():
+        if device_info["device_name"].lower() != device_name.lower():
+            continue
 
-    # Step 1: Create the table if it doesn't exist
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sensor_data (
-            id SERIAL PRIMARY KEY,
-            asset_uid TEXT,
-            timestamp BIGINT,
-            sensor_name TEXT,
-            value REAL
-        );
-    """)
-    conn.commit()
+        print(f"Found matching device: {device_name}")
 
-    # fetch payloads from KitchenDevices_virtual
-    cursor.execute("""
-        SELECT payload
-        FROM "KitchenDevices_virtual"
-    """)
-    rows = cursor.fetchall()
+        for sensor_name, sensor_info in device_info.get("sensors", {}).items():
+            if not sensor_info.get("unit") or sensor_info.get("type") != "SENSOR":
+                continue
 
-    # parse each payload and insert into sensor_data
-    for row in rows:
-        payload_json = row[0]
+            # Query values from last 3 hours
+            cursor.execute("""
+                SELECT time, payload
+                FROM "KitchenDevices_virtual"
+                WHERE payload::json->> %s IS NOT NULL
+                AND time >= NOW() - INTERVAL '3 hours'
+            """, (sensor_name,))
 
-        # if stored as a string, convert to dict
-        if isinstance(payload_json, str):
-            payload_json = json.loads(payload_json)
+            rows = cursor.fetchall()
+            print(f"{sensor_name}: {len(rows)} rows found")
 
-        asset_uid = payload_json.get('asset_uid')
-        timestamp = int(payload_json.get('timestamp'))
+            for time_obj, payload in rows:
+                payload_data = json.loads(payload) if isinstance(payload, str) else payload
+                value = payload_data.get(sensor_name)
 
-        for key, value in payload_json.items():
-            if key not in ['timestamp', 'topic', 'parent_asset_uid', 'asset_uid', 'board_name']:
-                sensor_name = key
-                sensor_value = float(value)
-                cursor.execute("""
-                    INSERT INTO sensor_data (asset_uid, timestamp, sensor_name, value)
-                    VALUES (%s, %s, %s, %s);
-                """, (asset_uid, timestamp, sensor_name, sensor_value))
+                # convert datetime to UNIX epoch
+                timestamp = time_obj.timestamp()
+                dict_1[device_name][sensor_name].append((timestamp, float(value)))
 
-    conn.commit()
+
     cursor.close()
     conn.close()
-    print("sensor_data table populated successfully.")
+
+
+
 
 def init_metadata():
     """
@@ -143,50 +149,33 @@ def init_metadata():
 
     return metadata_dict
 
-def handle_query_one(metadata):
-    """
-    Prints average moisture values from all fridges within a 3 hour interval.
-    Get the device type, timezone, sensor name and information from metadata dictionary.
-    Iterates through all sensors within 3 hour timestap, extracts value of sensor using SQL.
-    """
-    conn = psycopg2.connect(db_url)
-    cursor = conn.cursor()
 
-    moisture_values= []
 
-    # iterate through metadata_dict and find refrigerator devices
-    for asset_uid, metadata in metadata.items():
-        if metadata["device_type"].lower() != "refrigerator":
+def get_average_moisture_from_dict(metadata, dict_1):
+    """
+    Returns the average moisture from all fridges using the data in dict_1
+    collected within the past 3 hours.
+    """
+    now = time.time()
+    three_hours_ago = now - 3 * 3600
+    moisture_values = []
+
+    for asset_uid, device_info in metadata.items():
+        if device_info["device_type"].lower() != "refrigerator":
             continue
 
-        device_name = metadata["device_name"]
-        timezone = metadata.get("timezone", "PST")
+        device_name = device_info["device_name"]
 
-
-        # find the moisture sensor and filter for "% RH" units
-        for sensor_name, sensor_info in metadata["sensors"].items():
+        for sensor_name, sensor_info in device_info["sensors"].items():
             if sensor_info.get("unit", "").strip() == "% RH":
+                readings = dict_1.get(device_name, {}).get(sensor_name, [])
+                recent_readings = [val for ts, val in readings if ts >= three_hours_ago]
 
-                # query values from last 3 hours
-                cursor.execute("""
-                    SELECT payload
-                    FROM "KitchenDevices_virtual"
-                    WHERE payload::json->> %s IS NOT NULL
-                    AND time >= NOW() - INTERVAL '3 hours'
-                """, (sensor_name,))
+                print(f"{device_name} - {sensor_name}: {len(recent_readings)} readings in last 3 hours")
 
-                rows = cursor.fetchall() # in format: [(34.1), (23.1,), ...]
-
-                for (payload,) in rows:
-                    payload_data = json.loads(payload) if isinstance(payload, str) else payload
-                    value = payload_data.get(sensor_name)
-
-                    if value:
-                        moisture_values.append(float(value))
-                break
+                moisture_values.extend(recent_readings)
+                break  # only one RH sensor per fridge
     
-    cursor.close()
-    conn.close()
 
     if moisture_values:
         avg = sum(moisture_values) / len(moisture_values)
@@ -194,18 +183,17 @@ def handle_query_one(metadata):
     else:
         return "No recent moisture data found for your kitchen fridge."
 
+
 def handle_query_two(metadata):
     """
     Assuming a cycle is 30 minutes with a 1-minute sample rate
     """
     conn = psycopg2.connect(db_url)
     cursor = conn.cursor()
-
+    
     gallon_values = []
 
     for asset_uid, metadata in metadata.items():
-
-        # iterate through metadata_dict and find dishwasher devices
         if metadata["device_type"].lower() != "dishwasher":
             continue
 
@@ -282,7 +270,7 @@ def main():
                     # ADD NEW CODE HERE
 
                     if query == "1":
-                        response = handle_query_one(metadata)
+                        response = get_average_moisture_from_dict(metadata, dict_1)
                     elif query == "2":
                         response = handle_query_two(metadata)
 
@@ -298,18 +286,21 @@ def main():
     finally:
         TCPSocket.close()
 
+
+def update(metadata):
+    update_dict1("Fridge 2", metadata)
+    print("updated dictionaries")
+
 if __name__ == "__main__":
-    main()
+    metadata = init_metadata()
+    # main()
 
 
-    """
-    running a function every t time
-
-    schedule.every(5).seconds.do(test)
+    schedule.every(5).seconds.do(lambda: update(metadata))
     while True:
         schedule.run_pending()
         time.sleep(1)
-    """"
+
 
 
 
