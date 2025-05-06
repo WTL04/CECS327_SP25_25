@@ -6,6 +6,7 @@ import json
 import schedule
 import time 
 from collections import defaultdict
+import threading 
 
 
 # loading in .env variable
@@ -15,12 +16,12 @@ print("Database connected!")
 
 # global device dictionaries 
 dict_1 = defaultdict(lambda: defaultdict(list))
-dict_2 = defaultdict(list)
-dict_3 = defaultdict(list)
+dict_2 = defaultdict(lambda: defaultdict(list))
+dict_3 = defaultdict(lambda: defaultdict(list))
 
 
 
-def update_dict1(device_name, metadata):
+def update_dict(device_name, target_dict, metadata):
     """
     Updates dict_1 to contain device name as key and sensor readings as lists of (timestamp, value) tuples.
         
@@ -46,7 +47,7 @@ def update_dict1(device_name, metadata):
             if not sensor_info.get("unit") or sensor_info.get("type") != "SENSOR":
                 continue
 
-            # Query values from last 3 hours
+            # query values from last 3 hours
             cursor.execute("""
                 SELECT time, payload
                 FROM "KitchenDevices_virtual"
@@ -63,13 +64,11 @@ def update_dict1(device_name, metadata):
 
                 # convert datetime to UNIX epoch
                 timestamp = time_obj.timestamp()
-                dict_1[device_name][sensor_name].append((timestamp, float(value)))
+                target_dict[device_name][sensor_name].append((timestamp, float(value)))
 
 
     cursor.close()
     conn.close()
-
-
 
 
 def init_metadata():
@@ -234,16 +233,14 @@ def handle_query_two(metadata):
 
 
 def main():
-   
-    # create database for sensor data 
-    # init_database()
 
     # get metadata dictionary containing metadata attributes
     metadata = init_metadata()
+   
 
     # ask the user for IP address and port number
     ip = "0.0.0.0"
-    port = 4445
+    port = 4444
     # ip = input("Enter IP address: ")
     # port = int(input("Enter port number: "))
     
@@ -287,19 +284,37 @@ def main():
         TCPSocket.close()
 
 
-def update(metadata):
-    update_dict1("Fridge 2", metadata)
-    print("updated dictionaries")
-
-if __name__ == "__main__":
-    metadata = init_metadata()
-    # main()
-
-
+    # updating dictionaries for recent data retrieval 
     schedule.every(5).seconds.do(lambda: update(metadata))
     while True:
         schedule.run_pending()
         time.sleep(1)
+
+
+
+def update(metadata):
+    update_dict("Fridge 2", dict_1, metadata)
+    update_dict("Fridge 1", dict_2, metadata)
+    update_dict("Dishwasher", dict_3, metadata)
+
+def start_scheduler(metadata):
+    schedule.every(5).seconds.do(lambda: update(metadata))
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+    print("schedule update")
+
+
+if __name__ == "__main__":
+    metadata = init_metadata()
+
+    # updating dictionaries for recent data retrieval on background thread
+    scheduler_thread = threading.Thread(target=start_scheduler, args=(metadata,), daemon=True)
+    scheduler_thread.start()
+
+    main()
+
+
 
 
 
