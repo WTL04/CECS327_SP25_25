@@ -48,6 +48,8 @@ def load_metadata(cursor):
                 name_map[board_uid] = device_name
 
     print(f"Loaded metadata for {len(sensor_map)} boards/devices")
+    print(sensor_map) # debug
+    print(name_map) # debug
     return sensor_map, name_map
 
 def populate_initial_cache(cursor, device_data):
@@ -280,6 +282,10 @@ def main():
 
     # initializing metadata 
     sensor_map, name_map = load_metadata(cursor)
+
+    # nested dictionary 
+    # outer dict: keys are asset_uid
+    # inner dict: keys are sensor name with values is a list of (timestamp, value) tuples
     device_data = {
         uid: {sensor: [] for sensor in sensors}
         for uid, sensors in sensor_map.items()
