@@ -48,8 +48,6 @@ def load_metadata(cursor):
                 name_map[board_uid] = device_name
 
     print(f"Loaded metadata for {len(sensor_map)} boards/devices")
-    print(sensor_map) # debug
-    print(name_map) # debug
     return sensor_map, name_map
 
 def populate_initial_cache(cursor, device_data):
