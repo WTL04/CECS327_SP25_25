@@ -1,259 +1,328 @@
 import socket
 import os
-from dotenv import load_dotenv
-import psycopg2 
 import json
-import schedule
-import time 
-from collections import defaultdict
 import threading
+import time
+import datetime
+import pytz
+from dotenv import load_dotenv
+import psycopg2
 
-# Load .env variable
-load_dotenv()
-db_url = os.getenv("DATABASE")
-print("Database connected!")
+def connect_db():
+    load_dotenv()
+    conn = psycopg2.connect(os.getenv("DATABASE"))
+    print("Database connected!")
+    return conn
 
-# Global device dictionaries
-fridge1_dict = defaultdict(list)
-fridge2_dict = defaultdict(list)
-dishwasher_dict = defaultdict(list)
-
-
-def update_dict_for_device(device_name, target_dict, metadata):
+def load_metadata(cursor):
     """
-    Updates a target dictionary to contain sensor readings as lists of (timestamp, value) tuples
-    for a single device only.
-
-    Only includes sensors with a valid unit and of type SENSOR.
-    Values are pulled from the last 3 hours from KitchenDevices_virtual table.
-
-    Example output:
-        {
-            "Sensor 1": [(timestamp, 1.2), ...],
-            "Sensor 2": [(timestamp, 2.4), ...],
-        }
+    Returns two dicts:
+      - sensor_map: board_asset_uid -> list of sensor names
+      - name_map:   board_asset_uid -> human device name (e.g. "Fridge 1")
     """
-    conn = psycopg2.connect(db_url)
-    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT "customAttributes" FROM "KitchenDevices_metadata";'
+    )
+    sensor_map = {}
+    name_map = {}
     
-    for asset_uid, device_info in metadata.items():
-        # skip all devices except the one matching device_name
-        if device_info["device_name"].lower() != device_name.lower():
-            continue
+    # search through all metadata
+    for (raw_meta,) in cursor.fetchall():
 
-        print(f"Updating device: {device_name}")
+        rec = raw_meta if isinstance(raw_meta, dict) else json.loads(raw_meta)
+        device_name = rec.get("name")
 
-        # iterate over all sensors for this device
-        for sensor_name, sensor_info in device_info.get("sensors", {}).items():
-            # skip sensors without a unit or of the wrong type
-            if not sensor_info.get("unit") or sensor_info.get("type") != "SENSOR":
-                continue
+        # searching through board and sensors 
+        for board in rec.get("children", []):
+            board_uid = board.get("assetUid")
+            sensors = board.get("customAttributes", {}).get("children", [])
+            names = []
 
-            # query recent sensor readings from the last 3 hours
-            cursor.execute("""
-                SELECT time, payload
-                FROM "KitchenDevices_virtual"
-                WHERE payload::json->> %s IS NOT NULL
-                AND time >= NOW() - INTERVAL '3 hours'
-            """, (sensor_name,))
+            # appending sensors to sensor_map and device_name to name_map
+            for s in sensors:
+                ca = s.get("customAttributes", {})
+                if ca.get("type") == "SENSOR":
+                    names.append(ca.get("name"))
+            if board_uid and names:
+                sensor_map[board_uid] = names
+                name_map[board_uid] = device_name
 
-            rows = cursor.fetchall()
+    print(f"Loaded metadata for {len(sensor_map)} boards/devices")
+    return sensor_map, name_map
 
-            # iterate over result rows
-            for time_obj, payload in rows:
-                # parse JSON payload if needed
-                payload_data = json.loads(payload) if isinstance(payload, str) else payload
-                
-                # extract sensor value
-                value = payload_data.get(sensor_name)
-
-                if value is not None:
-                    timestamp = time_obj.timestamp()  # convert datetime to UNIX time
-                    try:
-                        target_dict[sensor_name].append((timestamp, float(value)))
-                    except ValueError:
-                        print(f"Warning: Skipped non-numeric value for {sensor_name}: {value}")
-
-        break  # stop after processing the matching device
-
-    cursor.close()
-    conn.close()
-
-def init_metadata():
+def populate_initial_cache(cursor, device_data):
     """
-    Returns a dictionary of all device metadata.
+    Load last 3 hours of readings into device_data.
+    Return the most recent timestamp seen.
     """
-    print("Parsing metadata information...")
-    conn = psycopg2.connect(db_url)
-    cursor = conn.cursor()
-
     cursor.execute("""
-        SELECT "assetUid", "assetType", "customAttributes"
-        FROM "KitchenDevices_metadata"; 
+        SELECT payload, time
+        FROM "KitchenDevices_virtual"
+        WHERE time > NOW() - INTERVAL '3 hours'
+        ORDER BY time ASC;
     """)
 
     rows = cursor.fetchall()
-    metadata_dict = {}
+    last_time = None
+    count = 0 # tracks number of readings
+    
+    # from virtual data, grab the payload and timestamp 
+    for raw_payload, ts in rows:
+        payload = raw_payload if isinstance(raw_payload, dict) else json.loads(raw_payload)
+        uid = payload.get("asset_uid")
 
-    for asset_uid, asset_type, custom_attrs in rows:
-        try:
-            obj = json.loads(custom_attrs) if isinstance(custom_attrs, str) else custom_attrs
+        # skip unknown devices
+        if uid not in device_data:
+            continue
 
-            device_name = obj.get("name", asset_uid)
-            additional = obj.get("additionalMetadata", {})
+        # search for sensors in device, add values to cache
+        for sensor in device_data[uid]:
+            if sensor in payload:
+                try:
+                    val = float(payload[sensor])
+                except (TypeError, ValueError):
+                    continue
+                device_data[uid][sensor].append((ts, val))
+                count += 1
+        last_time = ts
+
+    # Trim to at most 180 entries per sensor
+    for sensors in device_data.values():
+        for lst in sensors.values():
+            if len(lst) > 180:
+                del lst[0:len(lst)-180]
+
+    if last_time is None:
+        last_time = datetime.datetime.now(datetime.timezone.utc)
+
+    print(f"Initial cache populated with {count} readings (last 3 hours)")
+    return last_time
+
+def start_cache_refresher(cursor, device_data, lock, last_time_holder):
+    """
+    Every 30 seconds, fetch new rows since last_time_holder[0],
+    append to device_data, trim to 180 entries, and log in PST.
+    """
+    pst = pytz.timezone("America/Los_Angeles")
+
+    def refresher():
+        while True:
+            with lock:
+                cursor.execute("""
+                    SELECT payload, time
+                    FROM "KitchenDevices_virtual"
+                    WHERE time > %s
+                    ORDER BY time ASC;
+                """, (last_time_holder[0],))
+                rows = cursor.fetchall()
+
+                new_count = 0
+                for raw_payload, ts in rows:
+                    payload = raw_payload if isinstance(raw_payload, dict) else json.loads(raw_payload)
+                    uid = payload.get("asset_uid")
+
+                    # skip unknown devices
+                    if uid not in device_data:
+                        continue
+
+                    # search for sensors in device, add values to cache
+                    for sensor in device_data[uid]:
+                        if sensor in payload:
+                            try:
+                                val = float(payload[sensor])
+                            except (TypeError, ValueError):
+                                continue
+                            lst = device_data[uid][sensor]
+                            lst.append((ts, val))
+                            new_count += 1
+
+                            # remove old data when cache reaches length of 180
+                            if len(lst) > 180:
+                                del lst[0]
+
+                    last_time_holder[0] = ts
+                
+                # display the time the cache is updated
+                now_pst = datetime.datetime.now(pst)
+                ts_str = now_pst.strftime("%Y-%m-%d %I:%M %p %Z")
+                print(f"[{ts_str}] Cache refresher ran: {new_count} new readings added")
+
+            time.sleep(30)
+    
+    # starting separate thread for referesher to run in background
+    thread = threading.Thread(target=refresher, daemon=True)
+    thread.start()
+
+def handle_query(query, device_data, name_map):
+    """
+    Process user queries against the in-memory device_data cache,
+    using name_map to translate board_uids to human names.
+    """
+    q = query.lower()
+    pst = pytz.timezone("America/Los_Angeles")
+    VOLTAGE = 120.0
+    WH_CONVERSION = 1000.0
+
+    # 1) Average moisture over last 3 hours, with PST range
+    if "average moisture" in q:
+        readings = []
+        for sensors in device_data.values():
+
+            # append all readings (timestamp, current) after matching the sensor "moisture meter"
+            for name, ents in sensors.items():
+                if "moisture meter" in name.lower():
+                    readings.extend(ents)
+        if readings:
+
+            # computing average 
+            values = [val for ts, val in readings]
+            avg = sum(values) / len(values)
+
+            # converting timestamp into PST
+            times = [ts for ts, _ in readings]
+            earliest = min(times).astimezone(pst)
+            latest   = max(times).astimezone(pst)
+            fmt = "%Y-%m-%d %I:%M %p %Z"
             
-            metadata_dict[asset_uid] = {
-                "device_name": device_name,
-                "device_type": additional.get("device_type", asset_type),
-                "timezone": additional.get("timezone", "PST"),
-                "location": additional.get("location", ""),
-                "sensors": {}
-            }
+            return (
+                f"Average moisture from {earliest.strftime(fmt)} "
+                f"to {latest.strftime(fmt)}: {avg:.2f}% RH"
+            )
+        return "No moisture data available."
 
-            for board in obj.get("children", []):
-                for sensor in board.get("customAttributes", {}).get("children", []):
-                    sensor_attrs = sensor.get("customAttributes", {})
-                    sensor_name = sensor_attrs.get("name", "").strip()
-                    if sensor_name:
-                        metadata_dict[asset_uid]["sensors"][sensor_name] = {
-                            "type": sensor_attrs.get("type", "SENSOR"),
-                            "unit": sensor_attrs.get("unit"),
-                            "min": sensor_attrs.get("minValue"),
-                            "max": sensor_attrs.get("maxValue"),
-                            "desiredMin": sensor_attrs.get("desiredMinValue"),
-                            "desiredMax": sensor_attrs.get("desiredMaxValue")
-                        }
-        except Exception as e:
-            print(f"[Metadata error for {asset_uid}]: {e}")
+    # 2) Estimated total water used over last 1 hour (gallons) with PST range
+    elif "water consumption" in q:
+        readings = []
+        for sensors in device_data.values():
 
-    cursor.close()
-    conn.close()
-    return metadata_dict
+            # append all readings (timestamp, current) after matching the sensor "yf-s201"
+            for name, ents in sensors.items():
+                if "yf-s201" in name.lower() or "water" in name.lower():
+                    readings.extend(ents)
 
-def handle_query_one(metadata):
-    """
-    Returns the average moisture from all fridges over the past 3 hours.
-    """
-    now = time.time()
-    three_hours_ago = now - 3 * 3600
-    moisture_values = []
+        if readings:
+            # sort, take freshest 60 (1h)
+            readings.sort(key=lambda x: x[0])
+            recent = readings[-60:]
+            values = [val for ts, val in recent]
+            avg_lpm = sum(values) / len(values)
+            total_liters = avg_lpm * 5
+            total_gallons = total_liters * 0.264172
 
-    for asset_uid, device_info in metadata.items():
-        if device_info["device_type"].lower() != "refrigerator":
-            continue
+            # convert timestamp into PST
+            times = [ts for ts, _ in recent]
+            earliest = min(times).astimezone(pst)
+            latest   = max(times).astimezone(pst)
+            fmt = "%Y-%m-%d %I:%M %p %Z"
 
-        device_name = device_info["device_name"]
+            return (
+                f"Water used from {earliest.strftime(fmt)} "
+                f"to {latest.strftime(fmt)}: {total_gallons:.2f} gallons"
+            )
+        return "No water consumption data available."
 
-        if device_name.lower() == "fridge 1":
-            sensor_dict = fridge1_dict
-        elif device_name.lower() == "fridge 2":
-            sensor_dict = fridge2_dict
-        else:
-            continue
+    # 3) Highest electricity consumption in kWh over last 3h, with PST range
+    elif "consumed more electricity" in q:
+        energy_usage = {}
+        ranges = {}
+        factor = VOLTAGE / (60.0 * WH_CONVERSION)
 
-        for sensor_name, sensor_info in device_info["sensors"].items():
-            if sensor_info.get("unit", "").strip() == "% RH":
-                readings = sensor_dict.get(sensor_name, [])
-                recent_readings = [val for ts, val in readings if ts >= three_hours_ago]
+        # searching through device data
+        for uid, sensors in device_data.items():
+            entries = []
 
-                print(f"{device_name} - {sensor_name}: {len(recent_readings)} readings")
+            # append all readings (timestamp, current) after matching the sensor "acs712"
+            for name, ents in sensors.items():
+                if "acs712" in name.lower():
+                    entries.extend(ents)
 
-                moisture_values.extend(recent_readings)
-                break
+            # skip device if no "acs712" readings found
+            if not entries:
+                continue
 
-    if moisture_values:
-        avg = sum(moisture_values) / len(moisture_values)
-        return f"Average fridge moisture over past 3 hours: {avg:.2f}% RH"
-    else:
-        return "No recent moisture data found for your kitchen fridge."
+            # computing total amps, energy usage, time, and ranges
+            total_amps = sum(val for ts, val in entries)
+            energy_usage[uid] = total_amps * factor
+            times = [ts for ts, _ in entries]
+            ranges[uid] = (min(times), max(times))
 
+        if energy_usage:
 
-def handle_query_two(metadata):
-    """
-    Returns average dishwasher water consumption per cycle.
-    """
-    gallon_values = []
+            # finding max energy usage
+            top_uid = max(energy_usage, key=energy_usage.get)
+            top_name = name_map.get(top_uid, top_uid)
+            e = energy_usage[top_uid]
+            start, end = ranges[top_uid]
 
-    for asset_uid, device_info in metadata.items():
-        if device_info["device_type"].lower() != "dishwasher":
-            continue
+            # convert timestamps into PST
+            earliest = start.astimezone(pst)
+            latest   = end.astimezone(pst)
+            fmt = "%Y-%m-%d %I:%M %p %Z"
 
-        device_name = device_info["device_name"]
+            return (
+                f"{top_name} consumed most electricity ({e:.2f} kWh) "
+                f"from {earliest.strftime(fmt)} to {latest.strftime(fmt)}"
+            )
+        return "No electricity data available."
 
-        for sensor_name, sensor_info in device_info["sensors"].items():
-            if sensor_info.get("unit", "").strip() == "Liters Per Minute":
-                readings = dishwasher_dict.get(sensor_name, [])
-                values = [val for _, val in sorted(readings)]
-
-                for i in range(0, len(values), 30):
-                    cycle = values[i:i+30]
-                    if len(cycle) == 30:
-                        total_liters = sum(cycle)
-                        total_gallons = total_liters * 0.264172
-                        gallon_values.append(total_gallons)
-
-    if gallon_values:
-        avg = sum(gallon_values) / len(gallon_values)
-        return f"Average dishwasher water usage per cycle: {avg:.2f} gallons"
-    else:
-        return "No recent dishwasher water data available."
-
-
-def update_all(metadata):
-    update_dict_for_device("Fridge 1", fridge1_dict, metadata)
-    update_dict_for_device("Fridge 2", fridge2_dict, metadata)
-    update_dict_for_device("Dishwasher", dishwasher_dict, metadata)
-    print("Updated all dictionaries.")
-
-def start_scheduler(metadata):
-    schedule.every(5).seconds.do(lambda: update_all(metadata))
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    # fallback help
+    return (
+        "Sorry, I can't process that query.\n"
+        "Please try one of:\n"
+        "1. What is the average moisture inside my kitchen fridge in the past three hours?\n"
+        "2. What is the average water consumption per cycle in my smart dishwasher?\n"
+        "3. Which device consumed more electricity among my three IoT devices?"
+    )
 
 def main():
-    metadata = init_metadata()
-    scheduler_thread = threading.Thread(target=start_scheduler, args=(metadata,), daemon=True)
-    scheduler_thread.start()
+    conn = connect_db()
+    cursor = conn.cursor()
 
-    ip = "0.0.0.0"
-    port = 4444
+    # initializing metadata 
+    sensor_map, name_map = load_metadata(cursor)
+    device_data = {
+        uid: {sensor: [] for sensor in sensors}
+        for uid, sensors in sensor_map.items()
+    }
+    
+    # initialzing initial cache
+    last_time = populate_initial_cache(cursor, device_data)
 
-    TCPSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    TCPSocket.bind((ip, port))
+    # running cache refresher 
+    lock = threading.Lock()
+    last_time_holder = [last_time]
+    start_cache_refresher(cursor, device_data, lock, last_time_holder)
+
+    # prompting user for IP and PORT
+    ip = input("Enter IP address: ")
+    port = int(input("Enter port number: "))
+    print()
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.bind((ip, port))
+    server_sock.listen(1)
     print(f"Server listening on {ip}:{port}")
-    TCPSocket.listen(5)
 
     try:
+        client_sock, addr = server_sock.accept()
+        print(f"Connected to {addr}")
         while True:
-            incomingSocket, incomingAddress = TCPSocket.accept()
-            print(f"Connected to {incomingAddress}")
-
-            try:
-                while True:
-                    query = incomingSocket.recv(8192).decode()
-                    if not query:
-                        break
-
-                    if query == "1":
-                        response = handle_query_one(metadata)
-                    elif query == "2":
-                        response = handle_query_two(metadata)
-                    else:
-                        response = "Invalid query."
-
-                    incomingSocket.send(response.encode("utf-8"))
-
-            except Exception as e:
-                print(f"Error: {e}")
-            finally:
-                incomingSocket.close()
-                print(f"{incomingAddress} disconnected.")
+            data = client_sock.recv(8192)
+            if not data:
+                print("Client disconnected; shutting down.")
+                break
+            text = data.decode("utf-8")
+            print(f"Received query: {text}")
+            with lock:
+                response = handle_query(text, device_data, name_map)
+            client_sock.send(response.encode("utf-8"))
     except KeyboardInterrupt:
-        print("\nServer shutting down...")
+        print("\nShutting down.")
     finally:
-        TCPSocket.close()
+        client_sock.close()
+        server_sock.close()
+        cursor.close()
+        conn.close()
 
 if __name__ == "__main__":
     main()
-
