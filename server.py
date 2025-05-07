@@ -6,48 +6,50 @@ import json
 import schedule
 import time 
 from collections import defaultdict
-import threading 
+import threading
 
-
-# loading in .env variable
+# Load .env variable
 load_dotenv()
 db_url = os.getenv("DATABASE")
 print("Database connected!")
 
-# global device dictionaries 
-dict_1 = defaultdict(lambda: defaultdict(list))
-dict_2 = defaultdict(lambda: defaultdict(list))
-dict_3 = defaultdict(lambda: defaultdict(list))
+# Global device dictionaries
+fridge1_dict = defaultdict(list)
+fridge2_dict = defaultdict(list)
+dishwasher_dict = defaultdict(list)
 
 
-
-def update_dict(device_name, target_dict, metadata):
+def update_dict_for_device(device_name, target_dict, metadata):
     """
-    Updates a target dictionary to contain device name as key and sensor readings as lists of (timestamp, value) tuples.
-        
-    Example:
+    Updates a target dictionary to contain sensor readings as lists of (timestamp, value) tuples
+    for a single device only.
+
+    Only includes sensors with a valid unit and of type SENSOR.
+    Values are pulled from the last 3 hours from KitchenDevices_virtual table.
+
+    Example output:
         {
-            "Fridge 2": {
-            "Moisture Meter - Fridge 2": [(timestamp, 1.2), ...],
-            "ACS712 - Fridge 2": [(timestamp, 1.2), ...),
-            "Other Sensor - Fridge 2": [(timestamp, 1.2), ...]
-            }
+            "Sensor 1": [(timestamp, 1.2), ...],
+            "Sensor 2": [(timestamp, 2.4), ...],
         }
     """
     conn = psycopg2.connect(db_url)
     cursor = conn.cursor()
     
     for asset_uid, device_info in metadata.items():
+        # skip all devices except the one matching device_name
         if device_info["device_name"].lower() != device_name.lower():
             continue
 
-        print(f"Found matching device: {device_name}")
+        print(f"Updating device: {device_name}")
 
+        # iterate over all sensors for this device
         for sensor_name, sensor_info in device_info.get("sensors", {}).items():
+            # skip sensors without a unit or of the wrong type
             if not sensor_info.get("unit") or sensor_info.get("type") != "SENSOR":
                 continue
 
-            # query values from last 3 hours
+            # query recent sensor readings from the last 3 hours
             cursor.execute("""
                 SELECT time, payload
                 FROM "KitchenDevices_virtual"
@@ -56,44 +58,32 @@ def update_dict(device_name, target_dict, metadata):
             """, (sensor_name,))
 
             rows = cursor.fetchall()
-            # debug print(f"{sensor_name}: {len(rows)} rows found")
 
+            # iterate over result rows
             for time_obj, payload in rows:
+                # parse JSON payload if needed
                 payload_data = json.loads(payload) if isinstance(payload, str) else payload
+                
+                # extract sensor value
                 value = payload_data.get(sensor_name)
 
-                # convert datetime to UNIX epoch
-                timestamp = time_obj.timestamp()
-                target_dict[device_name][sensor_name].append((timestamp, float(value)))
+                if value is not None:
+                    timestamp = time_obj.timestamp()  # convert datetime to UNIX time
+                    try:
+                        target_dict[sensor_name].append((timestamp, float(value)))
+                    except ValueError:
+                        print(f"Warning: Skipped non-numeric value for {sensor_name}: {value}")
 
+        break  # stop after processing the matching device
 
     cursor.close()
     conn.close()
 
-
 def init_metadata():
     """
-    Returns a dictionary of all device meta data 
-
-    Key: device asset_uid from sensor_data table on neonDB 
-    Value: device meta data similar to json format
-
-        metadata = {
-
-            "obj-62t-uf5-4r9": {
-                "device_name": "Fridge 1",
-                "device_type": "Refrigerator",
-                "timezone": "PST",
-                "sensors": {
-                "ACS712 - Fridge 1": { "unit": "Amperes", "type": "SENSOR" },
-                "Moisture Meter - Fridge 1": { "unit": "% RH", "type": "SENSOR" }
-                }
-            }
-
-        }
-
+    Returns a dictionary of all device metadata.
     """
-    print("parsing metadata information...")
+    print("Parsing metadata information...")
     conn = psycopg2.connect(db_url)
     cursor = conn.cursor()
 
@@ -103,7 +93,6 @@ def init_metadata():
     """)
 
     rows = cursor.fetchall()
-
     metadata_dict = {}
 
     for asset_uid, asset_type, custom_attrs in rows:
@@ -113,7 +102,6 @@ def init_metadata():
             device_name = obj.get("name", asset_uid)
             additional = obj.get("additionalMetadata", {})
             
-            # adding meta data into dictionary with asset_uid from KitchenDevices_metadata as key 
             metadata_dict[asset_uid] = {
                 "device_name": device_name,
                 "device_type": additional.get("device_type", asset_type),
@@ -122,14 +110,10 @@ def init_metadata():
                 "sensors": {}
             }
 
-            # traverse board children
             for board in obj.get("children", []):
                 for sensor in board.get("customAttributes", {}).get("children", []):
-
                     sensor_attrs = sensor.get("customAttributes", {})
                     sensor_name = sensor_attrs.get("name", "").strip()
-                    unit = sensor_attrs.get("unit", "").strip()
-
                     if sensor_name:
                         metadata_dict[asset_uid]["sensors"][sensor_name] = {
                             "type": sensor_attrs.get("type", "SENSOR"),
@@ -139,21 +123,16 @@ def init_metadata():
                             "desiredMin": sensor_attrs.get("desiredMinValue"),
                             "desiredMax": sensor_attrs.get("desiredMaxValue")
                         }
-
         except Exception as e:
             print(f"[Metadata error for {asset_uid}]: {e}")
 
     cursor.close()
     conn.close()
-
     return metadata_dict
 
-
-
-def handle_query_one(metadata, dict_1):
+def handle_query_one(metadata):
     """
-    Returns the average moisture from all fridges using the data in dict_1
-    collected within the past 3 hours.
+    Returns the average moisture from all fridges over the past 3 hours.
     """
     now = time.time()
     three_hours_ago = now - 3 * 3600
@@ -165,29 +144,33 @@ def handle_query_one(metadata, dict_1):
 
         device_name = device_info["device_name"]
 
+        if device_name.lower() == "fridge 1":
+            sensor_dict = fridge1_dict
+        elif device_name.lower() == "fridge 2":
+            sensor_dict = fridge2_dict
+        else:
+            continue
+
         for sensor_name, sensor_info in device_info["sensors"].items():
             if sensor_info.get("unit", "").strip() == "% RH":
-                readings = dict_1.get(device_name, {}).get(sensor_name, [])
+                readings = sensor_dict.get(sensor_name, [])
                 recent_readings = [val for ts, val in readings if ts >= three_hours_ago]
 
-                print(f"{device_name} - {sensor_name}: {len(recent_readings)} readings in last 3 hours")
+                print(f"{device_name} - {sensor_name}: {len(recent_readings)} readings")
 
                 moisture_values.extend(recent_readings)
-                break  # only one RH sensor per fridge
-    
+                break
 
     if moisture_values:
         avg = sum(moisture_values) / len(moisture_values)
-        return f"Average fridge moisture from all fridges over the past 3 hours: {avg:.2f}% RH"
+        return f"Average fridge moisture over past 3 hours: {avg:.2f}% RH"
     else:
         return "No recent moisture data found for your kitchen fridge."
 
 
-
-def handle_query_two(metadata, dict_2):
+def handle_query_two(metadata):
     """
-    Assuming a cycle is 30 minutes with a 1-minute sample rate.
-    Returns the average water consumption per cycle from dishwasher using data from dict_2.
+    Returns average dishwasher water consumption per cycle.
     """
     gallon_values = []
 
@@ -199,82 +182,68 @@ def handle_query_two(metadata, dict_2):
 
         for sensor_name, sensor_info in device_info["sensors"].items():
             if sensor_info.get("unit", "").strip() == "Liters Per Minute":
-                readings = dict_2.get(device_name, {}).get(sensor_name, [])
-                
-                print(readings) # debug
-
+                readings = dishwasher_dict.get(sensor_name, [])
                 values = [val for _, val in sorted(readings)]
 
-                print(values) #debug
-                
-
-                # group into cycles of 30 values (30 minutes)
-                cycle_totals = []
-                for i in range(len(values)):
-                    cycle += i
+                for i in range(0, len(values), 30):
+                    cycle = values[i:i+30]
                     if len(cycle) == 30:
                         total_liters = sum(cycle)
                         total_gallons = total_liters * 0.264172
-                        cycle_totals.append(total_gallons)
-
-                if cycle_totals:
-                    avg = sum(cycle_totals) / len(cycle_totals)
-                    return f"Average water consumption per cycle: {avg:.2f} gallons"
-                else:
-                    return "Not enough full cycles to compute average water usage."
-
-    return "Dishwasher device not found in metadata."
-
-    cursor.close()
-    conn.close()
+                        gallon_values.append(total_gallons)
 
     if gallon_values:
         avg = sum(gallon_values) / len(gallon_values)
-        return f"Average water consumption per cycle in smart dishwasher: {avg:.2f} gallons"
+        return f"Average dishwasher water usage per cycle: {avg:.2f} gallons"
     else:
-        return "No recent water consumption data found for your smart dishwasher."
+        return "No recent dishwasher water data available."
 
+
+def update_all(metadata):
+    update_dict_for_device("Fridge 1", fridge1_dict, metadata)
+    update_dict_for_device("Fridge 2", fridge2_dict, metadata)
+    update_dict_for_device("Dishwasher", dishwasher_dict, metadata)
+    print("Updated all dictionaries.")
+
+def start_scheduler(metadata):
+    schedule.every(5).seconds.do(lambda: update_all(metadata))
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
 def main():
-
-    # get metadata dictionary containing metadata attributes
     metadata = init_metadata()
-   
-    # ask the user for IP address and port number
+    scheduler_thread = threading.Thread(target=start_scheduler, args=(metadata,), daemon=True)
+    scheduler_thread.start()
+
     ip = "0.0.0.0"
     port = 4444
-    # ip = input("Enter IP address: ")
-    # port = int(input("Enter port number: "))
-    
-    # setting up socket and connecting an IP with a PORT number
+
     TCPSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     TCPSocket.bind((ip, port))
-    
-    # listening for 5 connections
     print(f"Server listening on {ip}:{port}")
     TCPSocket.listen(5)
-    
+
     try:
         while True:
             incomingSocket, incomingAddress = TCPSocket.accept()
             print(f"Connected to {incomingAddress}")
-            
+
             try:
                 while True:
-                    # receive data from client in string form
                     query = incomingSocket.recv(8192).decode()
                     if not query:
-                        break  # Exit loop if client disconnects
-
-                    # ADD NEW CODE HERE
+                        break
 
                     if query == "1":
-                        response = handle_query_one(metadata, dict_1)
+                        response = handle_query_one(metadata)
                     elif query == "2":
-                        response = handle_query_two(metadata, dict_2)
+                        response = handle_query_two(metadata)
+                    else:
+                        response = "Invalid query."
 
-                    # sending back to client
                     incomingSocket.send(response.encode("utf-8"))
+
             except Exception as e:
                 print(f"Error: {e}")
             finally:
@@ -285,30 +254,6 @@ def main():
     finally:
         TCPSocket.close()
 
-
-def update(metadata):
-    update_dict("Fridge 2", dict_1, metadata)
-    update_dict("Fridge 1", dict_2, metadata)
-    update_dict("Dishwasher", dict_3, metadata)
-    print("schedule update")
-
-def start_scheduler(metadata):
-    schedule.every(5).seconds.do(lambda: update(metadata))
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
 if __name__ == "__main__":
-    metadata = init_metadata()
-
-    # updating dictionaries for recent data retrieval on background thread
-    scheduler_thread = threading.Thread(target=start_scheduler, args=(metadata,), daemon=True)
-    scheduler_thread.start()
-
     main()
-
-
-
-
-
 
