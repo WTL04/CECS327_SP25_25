@@ -6,7 +6,6 @@ import time
 import datetime
 import pytz
 from dotenv import load_dotenv
-from collections import defaultdict
 import psycopg2
 
 def connect_db():
@@ -16,27 +15,40 @@ def connect_db():
     return conn
 
 def load_metadata(cursor):
-    cursor.execute('''
-        SELECT "customAttributes"
-        FROM "KitchenDevices_metadata";
-    ''')
-    mapping = {}
+    """
+    Returns two dicts:
+      - sensor_map: board_asset_uid -> list of sensor names
+      - name_map:   board_asset_uid -> human device name (e.g. "Fridge 1")
+    """
+    cursor.execute(
+        'SELECT "customAttributes" FROM "KitchenDevices_metadata";'
+    )
+    sensor_map = {}
+    name_map = {}
+
     for (raw_meta,) in cursor.fetchall():
         rec = raw_meta if isinstance(raw_meta, dict) else json.loads(raw_meta)
+        device_name = rec.get("name")
         for board in rec.get("children", []):
             board_uid = board.get("assetUid")
             sensors = board.get("customAttributes", {}).get("children", [])
-            names = [
-                s["customAttributes"]["name"]
-                for s in sensors
-                if s.get("customAttributes", {}).get("type") == "SENSOR"
-            ]
+            names = []
+            for s in sensors:
+                ca = s.get("customAttributes", {})
+                if ca.get("type") == "SENSOR":
+                    names.append(ca.get("name"))
             if board_uid and names:
-                mapping[board_uid] = names
-    print(f"Loaded metadata for {len(mapping)} boards/devices")
-    return mapping
+                sensor_map[board_uid] = names
+                name_map[board_uid] = device_name
+
+    print(f"Loaded metadata for {len(sensor_map)} boards/devices")
+    return sensor_map, name_map
 
 def populate_initial_cache(cursor, device_data):
+    """
+    Load last 3 hours of readings into device_data.
+    Return the most recent timestamp seen.
+    """
     cursor.execute("""
         SELECT payload, time
         FROM "KitchenDevices_virtual"
@@ -45,8 +57,8 @@ def populate_initial_cache(cursor, device_data):
     """)
     rows = cursor.fetchall()
     last_time = None
-
     count = 0
+
     for raw_payload, ts in rows:
         payload = raw_payload if isinstance(raw_payload, dict) else json.loads(raw_payload)
         uid = payload.get("asset_uid")
@@ -58,7 +70,7 @@ def populate_initial_cache(cursor, device_data):
                     val = float(payload[sensor])
                 except (TypeError, ValueError):
                     continue
-                device_data[uid][sensor].append(val)
+                device_data[uid][sensor].append((ts, val))
                 count += 1
         last_time = ts
 
@@ -76,10 +88,10 @@ def populate_initial_cache(cursor, device_data):
 
 def start_cache_refresher(cursor, device_data, lock, last_time_holder):
     """
-    Background thread: every 30s, pull new rows since last_time,
-    update device_data, and print PST‐timestamped status.
+    Every 30 seconds, fetch new rows since last_time_holder[0],
+    append to device_data, trim to 180 entries, and log in PST.
     """
-    PST = pytz.timezone("America/Los_Angeles")
+    pst = pytz.timezone("America/Los_Angeles")
 
     def refresher():
         while True:
@@ -105,15 +117,14 @@ def start_cache_refresher(cursor, device_data, lock, last_time_holder):
                             except (TypeError, ValueError):
                                 continue
                             lst = device_data[uid][sensor]
-                            lst.append(val)
+                            lst.append((ts, val))
                             new_count += 1
                             if len(lst) > 180:
                                 del lst[0]
                     last_time_holder[0] = ts
 
-                # PST‐timestamped log
-                now_pst = datetime.datetime.now(PST)
-                ts_str  = now_pst.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+                now_pst = datetime.datetime.now(pst)
+                ts_str = now_pst.strftime("%Y-%m-%d %I:%M %p %Z")
                 print(f"[{ts_str}] Cache refresher ran: {new_count} new readings added")
 
             time.sleep(30)
@@ -121,96 +132,115 @@ def start_cache_refresher(cursor, device_data, lock, last_time_holder):
     thread = threading.Thread(target=refresher, daemon=True)
     thread.start()
 
-def handle_query(query, device_data):
+def handle_query(query, device_data, name_map):
     """
-    Process user queries against the in-memory device_data cache.
+    Process user queries against the in-memory device_data cache,
+    using name_map to translate board_uids to human names.
     """
     q = query.lower()
-    VOLTAGE = 120.0  # volts
-    MINUTES_PER_HOUR = 60.0
-    WH_CONVERSION = 1000.0  # W to kW
+    pst = pytz.timezone("America/Los_Angeles")
+    VOLTAGE = 120.0
+    WH_CONVERSION = 1000.0
 
-    # 1) Average moisture
+    # 1) Average moisture over last 3 hours, with PST range
     if "average moisture" in q:
         readings = []
         for sensors in device_data.values():
-            for name, vals in sensors.items():
+            for name, ents in sensors.items():
                 if "moisture meter" in name.lower():
-                    readings.extend(vals)
+                    readings.extend(ents)
         if readings:
-            avg = sum(readings) / len(readings)
-            return f"Average moisture (last 3 h): {avg:.2f}% RH"
+            values = [val for ts, val in readings]
+            avg = sum(values) / len(values)
+            times = [ts for ts, _ in readings]
+            earliest = min(times).astimezone(pst)
+            latest   = max(times).astimezone(pst)
+            fmt = "%Y-%m-%d %I:%M %p %Z"
+            return (
+                f"Average moisture from {earliest.strftime(fmt)} "
+                f"to {latest.strftime(fmt)}: {avg:.2f}% RH"
+            )
         return "No moisture data available."
 
-    # 2) Average water consumption
+    # 2) Estimated total water used over last 1 hour (gallons) with PST range
     elif "water consumption" in q:
-        LITERS_TO_GALLONS = 0.264172
         readings = []
         for sensors in device_data.values():
-            for name, vals in sensors.items():
-                # match your dishwasher flow sensor(s)
+            for name, ents in sensors.items():
                 if "yf-s201" in name.lower() or "water" in name.lower():
-                    # take only the last 120 readings (one per minute)
-                    recent = vals[-120:]
-                    readings.extend(recent)
-
+                    readings.extend(ents)
         if readings:
-            total_liters = sum(readings)
-            total_gallons = total_liters * LITERS_TO_GALLONS
-            return f"Total water used in last 2 hours: {total_gallons:.2f} gallons"
-        else:
-            return "No water consumption data available."
+            # sort, take freshest 60 (1h)
+            readings.sort(key=lambda x: x[0])
+            recent = readings[-60:]
+            values = [val for ts, val in recent]
+            avg_lpm = sum(values) / len(values)
+            total_liters = avg_lpm * 5
+            total_gallons = total_liters * 0.264172
+            times = [ts for ts, _ in recent]
+            earliest = min(times).astimezone(pst)
+            latest   = max(times).astimezone(pst)
+            fmt = "%Y-%m-%d %I:%M %p %Z"
+            return (
+                f"Water used from {earliest.strftime(fmt)} "
+                f"to {latest.strftime(fmt)}: {total_gallons:.2f} gallons"
+            )
+        return "No water consumption data available."
 
-
-    # 3) Which device consumed more electricity? → report in kWh
+    # 3) Highest electricity consumption in kWh over last 3h, with PST range
     elif "consumed more electricity" in q:
         energy_usage = {}
-        # Each reading is amps over a 1-minute slice. Energy per reading (kWh):
-        #   Wh = V * I * (1/60)   →  kWh = Wh / 1000
-        # So kWh per reading = V * I / (60 * 1000) = V * I / 60000
-        CONVERSION_FACTOR = VOLTAGE / (MINUTES_PER_HOUR * WH_CONVERSION)  # 120/(60*1000)=0.002
-
+        ranges = {}
+        factor = VOLTAGE / (60.0 * WH_CONVERSION)
         for uid, sensors in device_data.items():
-            total_amps = sum(
-                sum(vals)
-                for name, vals in sensors.items()
-                if "acs712" in name.lower()
-            )
-            # total energy (kWh) over all those readings:
-            energy_kwh = total_amps * CONVERSION_FACTOR
-            energy_usage[uid] = energy_kwh
-
+            entries = []
+            for name, ents in sensors.items():
+                if "acs712" in name.lower():
+                    entries.extend(ents)
+            if not entries:
+                continue
+            total_amps = sum(val for ts, val in entries)
+            energy_usage[uid] = total_amps * factor
+            times = [ts for ts, _ in entries]
+            ranges[uid] = (min(times), max(times))
         if energy_usage:
-            top = max(energy_usage, key=energy_usage.get)
-            return (f"Device with highest electricity consumption: {top} "
-                    f"({energy_usage[top]:.2f} kWh over last 3 h)")
+            top_uid = max(energy_usage, key=energy_usage.get)
+            top_name = name_map.get(top_uid, top_uid)
+            e = energy_usage[top_uid]
+            start, end = ranges[top_uid]
+            earliest = start.astimezone(pst)
+            latest   = end.astimezone(pst)
+            fmt = "%Y-%m-%d %I:%M %p %Z"
+            return (
+                f"{top_name} consumed most electricity ({e:.2f} kWh) "
+                f"from {earliest.strftime(fmt)} to {latest.strftime(fmt)}"
+            )
         return "No electricity data available."
 
-    # fallback help text
-    else:
-        return (
-            "Sorry, I can't process that query.\n"
-            "Please try one of:\n"
-            "1. What is the average moisture inside my kitchen fridge in the past three hours?\n"
-            "2. What is the average water consumption per cycle in my smart dishwasher?\n"
-            "3. Which device consumed more electricity among my three IoT devices?"
-        )
-    
+    # fallback help
+    return (
+        "Sorry, I can't process that query.\n"
+        "Please try one of:\n"
+        "1. What is the average moisture inside my kitchen fridge in the past three hours?\n"
+        "2. What is the average water consumption per cycle in my smart dishwasher?\n"
+        "3. Which device consumed more electricity among my three IoT devices?"
+    )
+
 def main():
     conn = connect_db()
     cursor = conn.cursor()
 
-    metadata_map = load_metadata(cursor)
+    sensor_map, name_map = load_metadata(cursor)
     device_data = {
         uid: {sensor: [] for sensor in sensors}
-        for uid, sensors in metadata_map.items()
+        for uid, sensors in sensor_map.items()
     }
 
     last_time = populate_initial_cache(cursor, device_data)
 
-    data_lock = threading.Lock()
+    lock = threading.Lock()
     last_time_holder = [last_time]
-    start_cache_refresher(cursor, device_data, data_lock, last_time_holder)
+    start_cache_refresher(cursor, device_data, lock, last_time_holder)
 
     ip = input("Enter IP address: ")
     port = int(input("Enter port number: "))
@@ -227,23 +257,18 @@ def main():
             if not data:
                 print("Client disconnected; shutting down.")
                 break
-
             text = data.decode("utf-8")
             print(f"Received query: {text}")
-
-            with data_lock:
-                response = handle_query(text, device_data)
-
+            with lock:
+                response = handle_query(text, device_data, name_map)
             client_sock.send(response.encode("utf-8"))
-
     except KeyboardInterrupt:
-        print("\nKeyboard interrupt; exiting.")
+        print("\nShutting down.")
     finally:
         client_sock.close()
         server_sock.close()
         cursor.close()
         conn.close()
-        print("Server shut down.")
 
 if __name__ == "__main__":
     main()
