@@ -1,38 +1,49 @@
 import socket
 
-VALID_QUERIES = [
-    "What is the average moisture inside my kitchen fridge in the past three hours?",
-    "What is the average water consumption per cycle in my smart dishwasher?",
-    "Which device consumed more electricity among my three IoT devices?"
-]
+# Map menu numbers to full question text
+query_map = {
+    "1": "What is the average moisture inside my kitchen fridge in the past three hours?",
+    "2": "What is the average water consumption per cycle in my smart dishwasher?",
+    "3": "Which device consumed more electricity among my three IoT devices (two refrigerators and a dishwasher)?"
+}
 
-def main():
-    server_ip = input("Enter server IP: ")
-    server_port = int(input("Enter server port: "))
+if __name__ == "__main__":
+    host = input("Please enter the Host IP Address: ")
+    port = int(input("Please enter the Server's Port Number: "))
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
-        client_socket.connect((server_ip, server_port))
-        print("Connected to server.")
+    # establish socket connection with server
+    TCPSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    TCPSocket.connect((host, port))
 
+    try:
         while True:
-            print("\nChoose a query:")
-            for i, q in enumerate(VALID_QUERIES, 1):
-                print(f"{i}. {q}")
+            print("1. What is the average moisture inside my kitchen fridge in the past three hours?")
+            print("2. What is the average water consumption per cycle in my smart dishwasher?")
+            print("3. Which device consumed more electricity among my three IoT devices (two refrigerators and a dishwasher)?")
             print("0. Exit")
 
-            choice = input("Enter your choice (0-3): ")
+            choice = input("Please select a query (1, 2, 3, or 0): ")
 
             if choice == "0":
                 print("Exiting client.")
                 break
 
-            if choice in {"1", "2", "3"}:
-                query = VALID_QUERIES[int(choice) - 1]
-                client_socket.send(query.encode("utf-8"))
-                response = client_socket.recv(8192).decode()
-                print(f"Server response:\n{response}")
-            else:
-                print("Invalid option. Please try again.")
+            if choice not in query_map:
+                print("Sorry, this query cannot be processed. Please try one of (1, 2, or 3).")
+                continue
 
-if __name__ == "__main__":
-    main()
+            # 1) Lookup the full English question
+            full_query = query_map[choice]
+
+            # 2) Send the full question text to the server
+            TCPSocket.send(full_query.encode("utf-8"))
+
+            # 3) Receive and print the server's response
+            server_response = TCPSocket.recv(8192).decode("utf-8")
+            print("-----------------------------------------")
+            print(f"Server Response: {server_response}")
+            print("-----------------------------------------")
+
+    finally:
+        # ensure the socket is closed so the server sees EOF
+        TCPSocket.close()
