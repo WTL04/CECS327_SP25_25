@@ -5,9 +5,9 @@ This repository implements a complete end-to-end IoT pipeline using virtual devi
 ---
 
 ## 📁 Project Structure
-├── server.py # TCP server with metadata-driven cache
-├── client.py # Interactive TCP client
-├── requirements.txt # Python dependencies
+├── server.py # TCP server with metadata-driven cache <br\>
+├── client.py # Interactive TCP client <br\>
+├── requirements.txt # Python dependencies <br\>
 └── README.md # This file
 
 ---
