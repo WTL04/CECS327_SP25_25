@@ -52,9 +52,9 @@ python client.py
 - Enter Host IP Address: same as server’s IP
 - Enter Port Number: same as server’s port <br/>
 Use the menu to select:
-- Average fridge moisture (past 3 hours)
-- Total dishwasher water (past 1 hour)
-- Highest electricity consumer (past 3 hours)
-- Exit with 0.
+  - Average fridge moisture (past 3 hours)
+  - Total dishwasher water (past 1 hour)
+  - Highest electricity consumer (past 3 hours)
+  - Exit with 0.
 
 **THAT'S IT!**
